@@ -36,23 +36,24 @@ class Scholar(BaseTool):
         'X-API-KEY': SERPER_KEY,
         'Content-Type': 'application/json'
         }
+        print(f"[Serper/Scholar] query={query[:80]} key={'set' if SERPER_KEY else 'EMPTY'}")
         for i in range(5):
             try:
                 conn.request("POST", "/scholar", payload, headers)
                 res = conn.getresponse()
                 break
             except Exception as e:
-                print(e)
+                print(f"[Serper/Scholar] EXCEPTION attempt {i+1}/5: {type(e).__name__}: {e}")
                 if i == 4:
                     return f"Google Scholar Timeout, return None, Please try again later."
                 continue
-        
 
         data = res.read()
-    
+
         results = json.loads(data.decode("utf-8"))
         try:
             if "organic" not in results:
+                print(f"[Serper/Scholar] ERROR no organic results: {str(results)[:200]}")
                 raise Exception(f"No results found for query: '{query}'. Use a less specific query.")
 
             web_snippets = list()
@@ -85,6 +86,7 @@ class Scholar(BaseTool):
                     redacted_version = redacted_version.replace("Your browser can't play this video.", "") 
                     web_snippets.append(redacted_version)
 
+            print(f"[Serper/Scholar] OK results={len(web_snippets)}")
             content = f"A Google scholar for '{query}' found {len(web_snippets)} results:\n\n## Scholar Results\n" + "\n\n".join(web_snippets)
             return content
         except:
