@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Personal Preferences
+
+- Use English for code and annotations, but communicate with me in Chinese.
+- Update README.md, CLAUDE.md, and any \*.sh files when modifications are needed.
+
 ## Project Overview
 
 **Tongyi DeepResearch** is an agentic LLM system (30B-A3B parameters) for long-horizon deep information-seeking tasks. It uses a ReAct inference paradigm where the model iteratively calls tools (web search, page visits, Python interpreter, file parsing, Google Scholar) until it reaches a final `<answer>`.
