@@ -1,22 +1,32 @@
-from openai import OpenAI
 import os
 from pydantic import BaseModel
 from typing import Literal
 import json
+import queue as _queue
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import time
+import random
 import re
 from collections import Counter, defaultdict
 from transformers import AutoTokenizer
 import argparse
 
-JUDGE_MODEL = "qwen-flash-2025-07-28"
-MAX_WORKERS = 20
+from judge_utils import (
+    _PriorityQueue,
+    SlidingWindowRateLimiter,
+    get_client,
+    _is_rate_limit_error,
+    _is_terminal_error,
+    _rate_limit_delay,
+)
 
-API_KEY = os.getenv("API_KEY", "")
-BASE_URL = os.getenv("API_BASE", "")
+JUDGE_MODEL = "qwen-flash-2025-07-28"
+MAX_WORKERS = 5
+MAX_RETRIES = 100
+JITTER = 0.5
+MAX_CALLS_PER_MINUTE = 30
+
+rate_limiter = SlidingWindowRateLimiter(MAX_CALLS_PER_MINUTE)
 
 
 def load_jsonl(fp):
@@ -27,18 +37,6 @@ def load_jsonl(fp):
 def write_jsonl(data, fp):
     with open(fp, "w", encoding="utf-8") as f:
         f.write("\n".join(json.dumps(line, ensure_ascii=False) for line in data) + "\n")
-
-
-thread_local = threading.local()
-
-
-def get_client():
-    if not hasattr(thread_local, "client"):
-        thread_local.client = OpenAI(
-            api_key=API_KEY,
-            base_url=BASE_URL,
-        )
-    return thread_local.client
 
 
 JUDGE_PROMPT = """Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
@@ -68,34 +66,129 @@ class ExtractedAnswer(BaseModel):
     strict: Literal[True]
 
 
-def extract_answer(question, correct_answer, response):
+def _extract_once(question, correct_answer, response):
+    """Single attempt at the judge API (no retry).
+    Returns (result_dict | None, exception | None).
+    Caller checks exc type: 'length limit' str → terminal, else retryable."""
+    rate_limiter.acquire()
     client = get_client()
     prompt = JUDGE_PROMPT.format(
         question=question, correct_answer=correct_answer, response=response
     )
-    for i in range(6):
+    try:
+        response_obj = client.beta.chat.completions.parse(
+            model=JUDGE_MODEL,
+            max_completion_tokens=8192,
+            messages=[{"role": "user", "content": prompt}],
+            response_format=ExtractedAnswer,
+            timeout=60.0,
+        )
+        content = response_obj.choices[0].message.parsed
+        return {
+            "correct_answer": correct_answer,
+            "model_answer": content.extracted_final_answer,
+            "reasoning": content.reasoning,
+            "correct": content.correct,
+            "confidence": content.confidence,
+        }, None
+    except Exception as e:
+        return None, e
+
+
+def _process_item_once(item, tokenizer):
+    """Single attempt to fully process one item.
+    Returns (report | None, exception | None, terminal: bool)."""
+    response = item["prediction"]
+    question, correct_answer = item["question"], item["answer"]
+    token_usage = item.get("usage", "")
+    tool_usage = Counter()
+
+    judge_result, exc = _extract_once(question, correct_answer, response)
+    if exc is not None:
+        terminal = _is_terminal_error(exc)
+        return None, exc, terminal
+
+    acc = 1 if judge_result["correct"] in ("y", "yes", "true", "positive") else 0
+    report = {
+        "acc": acc,
+        "turns": 0,
+        "token_usage": token_usage,
+        "tool_usage": tool_usage,
+        "item": item,
+        "context_length": len(tokenizer.encode("")),
+        "dollars_o4mini": 0,
+        "is_answer": 1,
+    }
+    return report, None, False
+
+
+def _queue_worker(q, results, lock, pending, pbar, tokenizer):
+    global MAX_RETRIES, JITTER
+    while True:
+        with lock:
+            if pending[0] == 0:
+                return
         try:
-            response_obj = client.beta.chat.completions.parse(
-                model=JUDGE_MODEL,
-                max_completion_tokens=8192,
-                messages=[{"role": "user", "content": prompt}],
-                response_format=ExtractedAnswer,
-                timeout=60.0,
+            retry_count, item = q.get(timeout=0.5)
+        except _queue.Empty:
+            continue
+
+        report, exc, terminal = _process_item_once(item, tokenizer)
+
+        if exc is None:
+            with lock:
+                results.append(report)
+                pending[0] -= 1
+                pbar.update(1)
+        elif terminal or retry_count >= MAX_RETRIES - 1:
+            if terminal:
+                print(f"Terminal error, skipping: {item['question'][:60]}: {exc}")
+            else:
+                print(f"Max retries exceeded: {item['question'][:60]}: {exc}")
+            with lock:
+                pending[0] -= 1
+                pbar.update(1)
+        else:
+            if _is_rate_limit_error(exc):
+                delay = _rate_limit_delay(retry_count, JITTER)
+                print(
+                    f"Rate limit, requeueing in {delay:.1f}s (retry {retry_count+1}/{MAX_RETRIES})"
+                )
+            else:
+                delay = random.uniform(1 - JITTER, 1 + JITTER)
+                print(
+                    f"Error, requeueing in {delay:.1f}s (retry {retry_count+1}/{MAX_RETRIES}): {exc}"
+                )
+            q.put(item, retry_count=retry_count + 1, delay=delay)
+
+
+def run_process_queue(items, tokenizer):
+    """Run judge calls via priority queue — workers never sleep,
+    rate-limited items are re-scheduled so fresh items aren't starved."""
+    global MAX_WORKERS
+    q = _PriorityQueue()
+    for item in items:
+        q.put(item)
+
+    results = []
+    lock = threading.Lock()
+    pending = [len(items)]
+
+    with tqdm(total=len(items), desc="Processing") as pbar:
+        workers = [
+            threading.Thread(
+                target=_queue_worker,
+                args=(q, results, lock, pending, pbar, tokenizer),
+                daemon=True,
             )
-            content = response_obj.choices[0].message.parsed
-            return {
-                "correct_answer": correct_answer,
-                "model_answer": content.extracted_final_answer,
-                "reasoning": content.reasoning,
-                "correct": content.correct,
-                "confidence": content.confidence,
-            }
-        except Exception as e:  # very, very rare
-            print("Error:", e)
-            if "length limit" in str(e):
-                return None
-            time.sleep(1)
-    return None
+            for _ in range(MAX_WORKERS)
+        ]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+
+    return results
 
 
 def extract_response(messages):
@@ -123,7 +216,7 @@ def process_item(item, tokenizer):
     token_usage = item.get("usage", "")
     tool_usage = Counter()
 
-    judge_result = extract_answer(question, correct_answer, response)
+    judge_result, _ = _extract_once(question, correct_answer, response)
     acc = 1 if judge_result["correct"] in ("y", "yes", "true", "positive") else 0
     context = ""
 
@@ -144,28 +237,43 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_fp", type=str, default="")
     parser.add_argument("--repeat_times", type=int, default=1)
-
     parser.add_argument("--tokenizer_path", type=str, default="")
+    parser.add_argument(
+        "--max_workers",
+        type=int,
+        default=MAX_WORKERS,
+        help="Number of parallel judge threads (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max_retries",
+        type=int,
+        default=MAX_RETRIES,
+        help="Max retry attempts per judge call (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--jitter",
+        type=float,
+        default=JITTER,
+        help="Retry backoff jitter as a fraction, e.g. 0.25 means ±25%% (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max_calls_per_minute",
+        type=int,
+        default=MAX_CALLS_PER_MINUTE,
+        help="Max API calls per minute via sliding window (default: %(default)s).",
+    )
 
     args = parser.parse_args()
+    MAX_WORKERS = args.max_workers
+    MAX_RETRIES = args.max_retries
+    JITTER = args.jitter
+    rate_limiter._max_calls = args.max_calls_per_minute
+
     input_fp = args.input_fp
     d = load_jsonl(input_fp) * args.repeat_times
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
-    res = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_item = {
-            executor.submit(process_item, item, tokenizer): item for item in d
-        }
-        for future in tqdm(
-            as_completed(future_to_item), total=len(d), desc="Processing"
-        ):
-            try:
-                result = future.result()
-                if result is not None:
-                    res.append(result)
-            except Exception as e:
-                print(f"Task failed with error: {e}")
+    res = run_process_queue(d, tokenizer)
 
     metrics = [i["acc"] for i in res]
     metrics = sum(metrics) / len(res) if res else 0
@@ -227,7 +335,7 @@ if __name__ == "__main__":
             if tool_use in cur_usage and i["acc"] == 1:
                 tool_usage_correct[tool_use].append(cur_usage[tool_use])
     tool_usage = {k: sum(v) / len(res) for k, v in tool_usage.items()}
-    correct_num = len([i for f in res if f["acc"] == 1])
+    correct_num = len([i for i in res if i["acc"] == 1])
     tool_usage_correct = {
         k: sum(v) / correct_num for k, v in tool_usage_correct.items()
     }

@@ -149,3 +149,14 @@ cache/
 models/
 outputs/
 checkpoints/
+
+# data
+data/
+
+# sandboxfusion
+SandboxFusion/
+
+# other
+explain/
+
+Open-DeepResearch/

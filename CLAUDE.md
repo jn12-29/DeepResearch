@@ -11,18 +11,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Tongyi DeepResearch** is an agentic LLM system (30B-A3B parameters) for long-horizon deep information-seeking tasks. It uses a ReAct inference paradigm where the model iteratively calls tools (web search, page visits, Python interpreter, file parsing, Google Scholar) until it reaches a final `<answer>`.
 
-## Environment Setup
-
-Requires Python **3.10.0** (other versions may cause dependency issues).
-
-```bash
-conda create -n react_infer_env python=3.10
-conda activate react_infer_env
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env with your API keys and model path
-```
-
 ## Key Configuration (`.env`)
 
 | Variable                  | Purpose                                                   |
@@ -35,27 +23,6 @@ cp .env.example .env
 | `API_KEY` / `API_BASE`    | OpenAI-compatible API for page summarization              |
 | `DASHSCOPE_API_KEY`       | Alibaba Dashscope for file parsing                        |
 | `SANDBOX_FUSION_ENDPOINT` | Python sandbox endpoints (comma-separated)                |
-
-## Running Inference
-
-```bash
-# Full pipeline: starts vLLM server + runs inference
-bash inference/run_react_infer.sh
-```
-
-## Running Evaluation
-
-```bash
-cd evaluation
-
-# HLE benchmark
-export API_KEY=... BASE_URL=...
-python evaluate_hle_official.py --input_fp <output_folder> --model_path <qwen_model_path>
-
-# Other benchmarks (GAIA, BrowseComp, FRAMES, etc.)
-export OPENAI_API_KEY=... OPENAI_API_BASE=... API_KEY=... BASE_URL=... Qwen2_5_7B_PATH=...
-python evaluate_deepsearch_official.py --input_fp <output_folder> --dataset <dataset_name>
-```
 
 ## Architecture
 

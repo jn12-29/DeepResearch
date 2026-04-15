@@ -7,3 +7,47 @@ kill -9 -$(lsof -t -i:6006)
 # download hle
 
 modelscope download --dataset cais/hle
+
+cd SandboxFusion && conda activate sandbox && make run-online
+
+
+---
+方案一：tmux（推荐）
+
+conda activate react_infer_env
+bash inference/run_react_infer.sh
+
+之后按 Ctrl+B 然后 D 来分离（detach），脚本继续在后台跑。
+tmux detach
+
+tmux new -s dr
+tmux attach -t dr
+
+tmux new -s sb
+tmux attach -t sb
+
+列出所有会话：
+tmux ls
+
+---
+方案二：nohup + 日志文件
+
+mkdir -p logs
+nohup bash inference/run_react_infer.sh > logs/infer_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+echo "PID: $!"
+
+实时追踪日志：
+tail -f logs/infer_*.log
+
+---
+
+CUDA_VISIBLE_DEVICES=0 python quant.py
+
+
+auto-round \
+  --model Tongyi-DeepResearch-30B-A3B \
+  --scheme W4A16 \
+  --iters 0 \
+  --group_size 128 \
+  --format auto_gptq \
+  --output_dir Tongyi-DeepResearch-30B-A3B-RTN-W4A16

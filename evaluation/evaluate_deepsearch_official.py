@@ -1,39 +1,39 @@
-from pydantic import BaseModel
-from openai import OpenAI
-import concurrent.futures
-from typing import Literal
+import heapq
+import queue as _queue
 import litellm
 import os
 import argparse
 import json
-import concurrent
 from tqdm import tqdm
 from transformers import AutoTokenizer
-import re
 from prompt import *
 import traceback
 import tiktoken
 import time
+import random
 import threading
 
-thread_local = threading.local()
+from judge_utils import (
+    _PriorityQueue,
+    SlidingWindowRateLimiter,
+    get_client,
+    _is_rate_limit_error,
+    _is_terminal_error,
+    _rate_limit_delay,
+)
+
+MAX_JUDGE_RETRIES = 100
+MAX_WORKERS = 5
+JITTER = 0.5
+MAX_CALLS_PER_MINUTE = 60
+
+rate_limiter = SlidingWindowRateLimiter(MAX_CALLS_PER_MINUTE)
 
 os.environ["OPENAI_API_KEY"] = os.getenv("API_KEY", "")
 os.environ["OPENAI_API_BASE"] = os.getenv("API_BASE", "")
-API_KEY = os.getenv("API_KEY", "")
-BASE_URL = os.getenv("API_BASE", "")
 
 JUDGE_MODEL = "qwen-flash-2025-07-28"  # for OpenAI client (Dashscope)
 JUDGE_MODEL_LITELLM = "openai/" + JUDGE_MODEL  # for litellm
-
-
-def get_client():
-    if not hasattr(thread_local, "client"):
-        thread_local.client = OpenAI(
-            api_key=API_KEY,
-            base_url=BASE_URL,
-        )
-    return thread_local.client
 
 
 extracted_answer_format_for_confidence = {
@@ -85,84 +85,182 @@ def is_correct_judgement(judgement):
     return judgement.lower() == "correct" or (judgement and judgement.lower()[0] == "a")
 
 
-def call_llm_judge(item):
-    global judge_prompt, dataset, judge_model
 
+def _judge_once(item):
+    """Single attempt at the judge API (no retry).
+    Returns (result_dict | None, exception | None).
+    json.JSONDecodeError in result means the response is unrecoverable."""
+    rate_limiter.acquire()
+    global judge_prompt, dataset
     question = item["question"]
     correct_answer = item["answer"]
     response = item["prediction"].strip()
     prompt = judge_prompt.format(
         question=question, correct_answer=correct_answer, response=response
     )
+    try:
+        if dataset == "xbench-deepsearch":
+            client = get_client()
+            response_obj = client.beta.chat.completions.parse(
+                model=JUDGE_MODEL,
+                max_completion_tokens=4096,
+                messages=[{"role": "user", "content": prompt}],
+                response_format=extracted_answer_format_for_xbench,
+                temperature=0,
+                timeout=100.0,
+            )
+            raw_judge = json.loads(response_obj.choices[0].message.content)
+            judgement = "Correct" if raw_judge["结论"].lower() == "正确" else ""
+        elif "browsecomp" in dataset:
+            resp = litellm.completion(
+                model=JUDGE_MODEL_LITELLM,
+                messages=[{"role": "user", "content": prompt}],
+                num_retries=5,
+                max_tokens=4096,
+                temperature=0,
+                response_format=extracted_answer_format_for_confidence,
+            )
+            raw_judge = json.loads(resp.choices[0].message["content"])
+            judgement = "Correct" if raw_judge["correct"].lower() == "yes" else ""
+        else:
+            resp = litellm.completion(
+                model=JUDGE_MODEL_LITELLM,
+                messages=[{"role": "user", "content": prompt}],
+                num_retries=5,
+                max_tokens=4096,
+                temperature=0,
+            )
+            judgement = resp.choices[0].message["content"]
+        return {
+            "question": question,
+            "answer": correct_answer,
+            "judgement": judgement,
+        }, None
+    except json.JSONDecodeError as e:
+        # Unrecoverable: bad JSON from model — don't retry
+        return {
+            "question": question,
+            "answer": correct_answer,
+            "judgement": "Error",
+            "error": str(e),
+        }, e
+    except Exception as e:
+        return None, e
 
-    for attempt in range(100):
+
+def _queue_worker(q, results, lock, pending, pbar):
+    global MAX_JUDGE_RETRIES, JITTER
+    while True:
+        with lock:
+            if pending[0] == 0:
+                return
         try:
-            if dataset == "xbench-deepsearch":
-                client = get_client()
-                response_obj = client.beta.chat.completions.parse(
-                    model=JUDGE_MODEL,
-                    max_completion_tokens=4096,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format=extracted_answer_format_for_xbench,
-                    temperature=0,
-                    timeout=100.0,
-                )
-                raw_judge = json.loads(response_obj.choices[0].message.content)
-                judgement = "Correct" if raw_judge["结论"].lower() == "正确" else ""
+            retry_count, item = q.get(timeout=0.5)
+        except _queue.Empty:
+            continue
 
-            elif "browsecomp" in dataset:
-                response = litellm.completion(
-                    model=JUDGE_MODEL_LITELLM,
-                    messages=[{"role": "user", "content": prompt}],
-                    num_retries=5,
-                    max_tokens=4096,
-                    temperature=0,
-                    response_format=extracted_answer_format_for_confidence,
-                )
+        result, exc = _judge_once(item)
 
-                raw_content = response.choices[0].message["content"]
-                raw_judge = json.loads(raw_content)
-                judgement = "Correct" if raw_judge["correct"].lower() == "yes" else ""
-
+        if exc is None or isinstance(exc, json.JSONDecodeError):
+            # Terminal: success or unrecoverable parse error
+            with lock:
+                results.append(result)
+                pending[0] -= 1
+                pbar.update(1)
+        elif _is_terminal_error(exc) or retry_count >= MAX_JUDGE_RETRIES - 1:
+            if _is_terminal_error(exc):
+                print(f"Terminal error, skipping: {item['question'][:60]}: {exc}")
             else:
-                response = litellm.completion(
-                    model=JUDGE_MODEL_LITELLM,
-                    messages=[{"role": "user", "content": prompt}],
-                    num_retries=5,
-                    max_tokens=4096,
-                    temperature=0,
+                print(f"Max retries exceeded: {item['question'][:60]}: {exc}")
+            with lock:
+                results.append(
+                    {
+                        "question": item["question"],
+                        "answer": item["answer"],
+                        "judgement": "Error",
+                        "error": str(exc),
+                    }
                 )
-                judgement = response.choices[0].message["content"]
+                pending[0] -= 1
+                pbar.update(1)
+        else:
+            if _is_rate_limit_error(exc):
+                delay = _rate_limit_delay(retry_count, JITTER)
+                print(
+                    f"Rate limit, requeueing in {delay:.1f}s (retry {retry_count+1}/{MAX_JUDGE_RETRIES})"
+                )
+            else:
+                delay = 3 * random.uniform(1 - JITTER, 1 + JITTER)
+                print(
+                    f"Error, requeueing in {delay:.1f}s (retry {retry_count+1}/{MAX_JUDGE_RETRIES}): {exc}"
+                )
+            q.put(item, retry_count=retry_count + 1, delay=delay)
 
-            return {
-                "question": question,
-                "answer": correct_answer,
-                "judgement": judgement,
-            }
 
-        except json.JSONDecodeError as e:
+def run_judge_queue(items, desc="Evaluating"):
+    """Run judge calls via priority queue — workers never sleep,
+    rate-limited items are re-scheduled so fresh items aren't starved."""
+    global MAX_WORKERS
+    q = _PriorityQueue()
+    for item in items:
+        q.put(item)
+
+    results = []
+    lock = threading.Lock()
+    pending = [len(items)]
+
+    with tqdm(total=len(items), desc=desc) as pbar:
+        workers = [
+            threading.Thread(
+                target=_queue_worker,
+                args=(q, results, lock, pending, pbar),
+                daemon=True,
+            )
+            for _ in range(MAX_WORKERS)
+        ]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+
+    return results
+
+
+def call_llm_judge(item):
+    """Blocking retry wrapper — kept for single/debug calls."""
+    global MAX_JUDGE_RETRIES, JITTER
+    for attempt in range(MAX_JUDGE_RETRIES):
+        result, exc = _judge_once(item)
+        if exc is None or isinstance(exc, json.JSONDecodeError):
+            return result
+        if attempt == MAX_JUDGE_RETRIES - 1:
             print(
-                f"Error judgement for question with attempt {attempt} : {question}: {e}"
+                f"Error judgement for question with attempt {attempt}: {item['question']}: {exc}"
             )
             return {
-                "question": question,
-                "answer": correct_answer,
+                "question": item["question"],
+                "answer": item["answer"],
                 "judgement": "Error",
-                "error": str(e),
+                "error": str(exc),
             }
-        except Exception as e:
-            if attempt == 4:
-                print(
-                    f"Error judgement for question with attempt {attempt} : {question}: {e}"
-                )
-                return {
-                    "question": question,
-                    "answer": correct_answer,
-                    "judgement": "Error",
-                    "error": str(e),
-                }
-            time.sleep(3)
-            continue
+        if _is_rate_limit_error(exc):
+            wait = _rate_limit_delay(attempt, JITTER)
+            print(
+                f"Rate limit hit, retrying in {wait:.1f}s... (attempt {attempt+1}/{MAX_JUDGE_RETRIES})"
+            )
+            time.sleep(wait)
+        elif _is_terminal_error(exc):
+            print(f"Terminal error, aborting: {item['question'][:60]}: {exc}")
+            return {
+                "question": item["question"],
+                "answer": item["answer"],
+                "judgement": "Error",
+                "error": str(exc),
+            }
+        else:
+            wait = 3 * random.uniform(1 - JITTER, 1 + JITTER)
+            print(f"Error, retrying in {wait:.1f}s... (attempt {attempt+1}/{MAX_JUDGE_RETRIES}): {exc}")
+            time.sleep(wait)
 
 
 def process_single_round(input_file):
@@ -544,7 +642,7 @@ def visualize_debug(items, judge_prompt, n=3):
 
 
 def main():
-    global judge_prompt, dataset, judge_model
+    global judge_prompt, dataset, judge_model, MAX_JUDGE_RETRIES, MAX_WORKERS, JITTER
     parser = argparse.ArgumentParser(
         description="Evaluate model predictions across multiple rounds"
     )
@@ -575,7 +673,36 @@ def main():
         default=3,
         help="Number of sample items to display in debug mode.",
     )
+    parser.add_argument(
+        "--max_workers",
+        type=int,
+        default=MAX_WORKERS,
+        help="Number of parallel judge threads (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max_retries",
+        type=int,
+        default=MAX_JUDGE_RETRIES,
+        help="Max retry attempts per judge call (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--jitter",
+        type=float,
+        default=JITTER,
+        help="Retry backoff jitter as a fraction, e.g. 0.25 means ±25%% (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max_calls_per_minute",
+        type=int,
+        default=MAX_CALLS_PER_MINUTE,
+        help="Max API calls per minute via sliding window (default: %(default)s).",
+    )
     args = parser.parse_args()
+
+    MAX_JUDGE_RETRIES = args.max_retries
+    MAX_WORKERS = args.max_workers
+    JITTER = args.jitter
+    rate_limiter._max_calls = args.max_calls_per_minute
 
     dataset = args.dataset
     judge_model = JUDGE_MODEL_LITELLM
@@ -624,17 +751,10 @@ def main():
 
     round_results = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-        for round_name, items in round_items.items():
-            futures = {executor.submit(call_llm_judge, item): item for item in items}
-            round_results[round_name] = []
-
-            for future in tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(futures),
-                desc=f"Evaluating {round_name}",
-            ):
-                round_results[round_name].append(future.result())
+    for round_name, items in round_items.items():
+        round_results[round_name] = run_judge_queue(
+            items, desc=f"Evaluating {round_name}"
+        )
 
     for round_name in ["round1", "round2", "round3"]:
         input_file = {
