@@ -1,12 +1,28 @@
+# convert GAIA parquet -> JSONL for DeepResearch inference
+# outputs to data/gaia/converted/, copies attachments to inference/eval_data/file_corpus/
+python data/gaia/scripts/convert_to_jsonl.py --split all
+
+# then set in .env:
+#   DATASET=/home/xh/DeepResearch/data/gaia/converted/gaia_2023_validation.jsonl
+# and run:
+#   bash inference/run_react_infer.sh
+
+---
+
 # run code sandbox
 sudo docker run -it --rm -p 8081:8080 vemlp-cn-beijing.cr.volces.com/preset-images/code-sandbox:server-20250609
 
+hf download gaia-benchmark/GAIA --repo-type dataset --local-dir ./gaia
+
 # kill old vllm
 kill -9 -$(lsof -t -i:6006)
-
+ps aux | grep vllm
+pkill -9 -f vllm
 # download hle
 
 modelscope download --dataset cais/hle
+
+modelscope download --model okwinds/Tongyi-DeepResearch-30B-A3B-Int4-W4A16 --local_dir ./Tongyi-DeepResearch-30B-A3B-Int4-W4A16
 
 cd SandboxFusion && conda activate sandbox && make run-online
 
@@ -41,7 +57,7 @@ tail -f logs/infer_*.log
 
 ---
 
-CUDA_VISIBLE_DEVICES=0 python quant.py
+CUDA_VISIBLE_DEVICES=6,7 python quant.py
 
 
 auto-round \

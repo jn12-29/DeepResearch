@@ -16,6 +16,4 @@ set -a  # automatically export all variables
 source "$ENV_FILE"
 set +a  # stop automatically exporting
 
-# python evaluation/evaluate_deepsearch_official.py --input_folder /home/xh/DeepResearch/inference/outputs/Tongyi-DeepResearch-30B-A3B_sglang/DeepSearch-2510 --dataset xbench-deepsearch
-
-python evaluation/evaluate_hle_official.py --input_fp /home/xh/DeepResearch/inference/outputs/Tongyi-DeepResearch-30B-A3B_sglang/hle_text_200
+python evaluation/evaluate_deepsearch_official.py --input_folder /home/xh/DeepResearch/inference/outputs/Tongyi-DeepResearch-30B-A3B_sglang/gaia_2023_validation --dataset gaia

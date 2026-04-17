@@ -160,3 +160,6 @@ SandboxFusion/
 explain/
 
 Open-DeepResearch/
+
+inference/eval_data/file_corpus/*
+inference/workspace/tools/file_parser/*

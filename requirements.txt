@@ -189,4 +189,3 @@ zipp==3.23.0
 
 # additional dependencies
 # datasets
-# gptqmodel

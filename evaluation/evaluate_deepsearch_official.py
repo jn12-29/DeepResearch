@@ -1,6 +1,4 @@
-import heapq
 import queue as _queue
-import litellm
 import os
 import argparse
 import json
@@ -8,8 +6,10 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from prompt import *
 import traceback
-import tiktoken
-import time
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 import random
 import threading
 
@@ -25,15 +25,14 @@ from judge_utils import (
 MAX_JUDGE_RETRIES = 100
 MAX_WORKERS = 5
 JITTER = 0.5
-MAX_CALLS_PER_MINUTE = 60
+MAX_CALLS_PER_MINUTE = 30
 
 rate_limiter = SlidingWindowRateLimiter(MAX_CALLS_PER_MINUTE)
 
 os.environ["OPENAI_API_KEY"] = os.getenv("API_KEY", "")
 os.environ["OPENAI_API_BASE"] = os.getenv("API_BASE", "")
 
-JUDGE_MODEL = "qwen-flash-2025-07-28"  # for OpenAI client (Dashscope)
-JUDGE_MODEL_LITELLM = "openai/" + JUDGE_MODEL  # for litellm
+JUDGE_MODEL = "qwen-flash-2025-07-28"
 
 
 extracted_answer_format_for_confidence = {
@@ -85,13 +84,11 @@ def is_correct_judgement(judgement):
     return judgement.lower() == "correct" or (judgement and judgement.lower()[0] == "a")
 
 
-
-def _judge_once(item):
+def _judge_once(item, judge_prompt, dataset):
     """Single attempt at the judge API (no retry).
     Returns (result_dict | None, exception | None).
     json.JSONDecodeError in result means the response is unrecoverable."""
     rate_limiter.acquire()
-    global judge_prompt, dataset
     question = item["question"]
     correct_answer = item["answer"]
     response = item["prediction"].strip()
@@ -99,8 +96,8 @@ def _judge_once(item):
         question=question, correct_answer=correct_answer, response=response
     )
     try:
+        client = get_client()
         if dataset == "xbench-deepsearch":
-            client = get_client()
             response_obj = client.beta.chat.completions.parse(
                 model=JUDGE_MODEL,
                 max_completion_tokens=4096,
@@ -112,32 +109,31 @@ def _judge_once(item):
             raw_judge = json.loads(response_obj.choices[0].message.content)
             judgement = "Correct" if raw_judge["结论"].lower() == "正确" else ""
         elif "browsecomp" in dataset:
-            resp = litellm.completion(
-                model=JUDGE_MODEL_LITELLM,
+            resp = client.beta.chat.completions.parse(
+                model=JUDGE_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                num_retries=5,
-                max_tokens=4096,
+                max_completion_tokens=4096,
                 temperature=0,
                 response_format=extracted_answer_format_for_confidence,
+                timeout=100.0,
             )
-            raw_judge = json.loads(resp.choices[0].message["content"])
+            raw_judge = json.loads(resp.choices[0].message.content)
             judgement = "Correct" if raw_judge["correct"].lower() == "yes" else ""
         else:
-            resp = litellm.completion(
-                model=JUDGE_MODEL_LITELLM,
+            resp = client.chat.completions.create(
+                model=JUDGE_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                num_retries=5,
-                max_tokens=4096,
+                max_completion_tokens=4096,
                 temperature=0,
+                timeout=100.0,
             )
-            judgement = resp.choices[0].message["content"]
+            judgement = resp.choices[0].message.content
         return {
             "question": question,
             "answer": correct_answer,
             "judgement": judgement,
         }, None
     except json.JSONDecodeError as e:
-        # Unrecoverable: bad JSON from model — don't retry
         return {
             "question": question,
             "answer": correct_answer,
@@ -148,7 +144,7 @@ def _judge_once(item):
         return None, e
 
 
-def _queue_worker(q, results, lock, pending, pbar):
+def _queue_worker(q, results, lock, pending, pbar, judge_prompt, dataset):
     global MAX_JUDGE_RETRIES, JITTER
     while True:
         with lock:
@@ -159,10 +155,9 @@ def _queue_worker(q, results, lock, pending, pbar):
         except _queue.Empty:
             continue
 
-        result, exc = _judge_once(item)
+        result, exc = _judge_once(item, judge_prompt, dataset)
 
         if exc is None or isinstance(exc, json.JSONDecodeError):
-            # Terminal: success or unrecoverable parse error
             with lock:
                 results.append(result)
                 pending[0] -= 1
@@ -184,22 +179,19 @@ def _queue_worker(q, results, lock, pending, pbar):
                 pending[0] -= 1
                 pbar.update(1)
         else:
+            delay = _rate_limit_delay(retry_count, JITTER)
             if _is_rate_limit_error(exc):
-                delay = _rate_limit_delay(retry_count, JITTER)
                 print(
                     f"Rate limit, requeueing in {delay:.1f}s (retry {retry_count+1}/{MAX_JUDGE_RETRIES})"
                 )
             else:
-                delay = 3 * random.uniform(1 - JITTER, 1 + JITTER)
                 print(
                     f"Error, requeueing in {delay:.1f}s (retry {retry_count+1}/{MAX_JUDGE_RETRIES}): {exc}"
                 )
             q.put(item, retry_count=retry_count + 1, delay=delay)
 
 
-def run_judge_queue(items, desc="Evaluating"):
-    """Run judge calls via priority queue — workers never sleep,
-    rate-limited items are re-scheduled so fresh items aren't starved."""
+def run_judge_queue(items, judge_prompt, dataset, desc="Evaluating"):
     global MAX_WORKERS
     q = _PriorityQueue()
     for item in items:
@@ -213,7 +205,7 @@ def run_judge_queue(items, desc="Evaluating"):
         workers = [
             threading.Thread(
                 target=_queue_worker,
-                args=(q, results, lock, pending, pbar),
+                args=(q, results, lock, pending, pbar, judge_prompt, dataset),
                 daemon=True,
             )
             for _ in range(MAX_WORKERS)
@@ -226,60 +218,18 @@ def run_judge_queue(items, desc="Evaluating"):
     return results
 
 
-def call_llm_judge(item):
-    """Blocking retry wrapper — kept for single/debug calls."""
-    global MAX_JUDGE_RETRIES, JITTER
-    for attempt in range(MAX_JUDGE_RETRIES):
-        result, exc = _judge_once(item)
-        if exc is None or isinstance(exc, json.JSONDecodeError):
-            return result
-        if attempt == MAX_JUDGE_RETRIES - 1:
-            print(
-                f"Error judgement for question with attempt {attempt}: {item['question']}: {exc}"
-            )
-            return {
-                "question": item["question"],
-                "answer": item["answer"],
-                "judgement": "Error",
-                "error": str(exc),
-            }
-        if _is_rate_limit_error(exc):
-            wait = _rate_limit_delay(attempt, JITTER)
-            print(
-                f"Rate limit hit, retrying in {wait:.1f}s... (attempt {attempt+1}/{MAX_JUDGE_RETRIES})"
-            )
-            time.sleep(wait)
-        elif _is_terminal_error(exc):
-            print(f"Terminal error, aborting: {item['question'][:60]}: {exc}")
-            return {
-                "question": item["question"],
-                "answer": item["answer"],
-                "judgement": "Error",
-                "error": str(exc),
-            }
-        else:
-            wait = 3 * random.uniform(1 - JITTER, 1 + JITTER)
-            print(f"Error, retrying in {wait:.1f}s... (attempt {attempt+1}/{MAX_JUDGE_RETRIES}): {exc}")
-            time.sleep(wait)
-
-
 def process_single_round(input_file):
     with open(input_file, "r", encoding="utf-8") as f:
-        items = [json.loads(line) for line in f]
-
-    return items
+        return [json.loads(line) for line in f if line.strip()]
 
 
 def get_termination_value(item):
     if "termination" in item:
         return item["termination"]
-
     messages = item.get("messages", [])
     if not messages:
         return "unknown"
-
     last_message = messages[-1]["content"] if messages else ""
-
     if "max_turns_reached" in last_message.lower():
         return "max_turns_reached"
     elif "max_tokens_reached" in last_message.lower():
@@ -290,62 +240,25 @@ def get_termination_value(item):
         return "unknown"
 
 
-def count_tokens_with_tokenizer(text, tokenizer):
+def count_tokens(text, tokenizer):
     try:
-        if hasattr(tokenizer, "encode"):
-            return len(tokenizer.encode(text))
-        else:
-            return len(tokenizer.encode(text))
-    except:
-
+        return len(tokenizer.encode(text))
+    except Exception:
         return len(text) // 4
-
-
-def aggregate_statistics(round1_file, round2_file, round3_file, tokenizer):
-    round1_stats = single_round_statistics(round1_file, tokenizer)
-    round2_stats = single_round_statistics(round2_file, tokenizer)
-    round3_stats = single_round_statistics(round3_file, tokenizer)
-
-    keys = round1_stats.keys()
-    avg_stats = {}
-    for key in keys:
-        if isinstance(round1_stats[key], dict):
-
-            avg_stats[key] = {}
-            all_keys = (
-                set(round1_stats[key].keys())
-                | set(round2_stats[key].keys())
-                | set(round3_stats[key].keys())
-            )
-            for nested_key in all_keys:
-                val1 = round1_stats[key].get(nested_key, 0)
-                val2 = round2_stats[key].get(nested_key, 0)
-                val3 = round3_stats[key].get(nested_key, 0)
-                avg_stats[key][nested_key] = round((val1 + val2 + val3) / 3, 3)
-        else:
-            avg_stats[key] = round(
-                (round1_stats[key] + round2_stats[key] + round3_stats[key]) / 3, 3
-            )
-
-    return avg_stats
 
 
 def single_round_statistics(input_file, tokenizer):
     contents = process_single_round(input_file)
 
     num_invalid, num_extra = 0, 0
-
     tool_use_cnt, visit_tool_cnt, search_tool_cnt, other_tool_cnt = [], [], [], []
-
     all_ans_lengths, all_think_lengths = [], []
-
-    all_assistant_tokens_per_question = []
-    all_assistant_tokens_per_message = []
+    all_assistant_tokens_per_question, all_assistant_tokens_per_message = [], []
     termination_counts = {}
 
     for item in contents:
         messages = item["messages"]
-        final_msg = messages[-1]["content"] if len(messages) else ""
+        final_msg = messages[-1]["content"] if messages else ""
 
         if "<answer>" not in final_msg or "</answer>" not in final_msg:
             num_invalid += 1
@@ -363,7 +276,6 @@ def single_round_statistics(input_file, tokenizer):
         for msg in messages:
             if msg["role"] == "assistant":
                 content = msg["content"]
-
                 remaining_content = content
                 while (
                     "<tool_call>" in remaining_content
@@ -377,10 +289,8 @@ def single_round_statistics(input_file, tokenizer):
                         ].strip()
                         if tool_call_content:
                             num_tool_use += 1
-
                             try:
-                                tool_call = json.loads(tool_call_content)
-                                tool_name = tool_call.get("name", "")
+                                tool_name = json.loads(tool_call_content).get("name", "")
                                 if tool_name == "search":
                                     num_search_tool += 1
                                 elif "visit" in tool_name:
@@ -394,12 +304,10 @@ def single_round_statistics(input_file, tokenizer):
                                     num_search_tool += 1
                                 else:
                                     num_other_tool += 1
-
                         remaining_content = remaining_content[end_idx + 12 :]
                     else:
                         break
 
-                # Bug 1 fix: extract actual <think> block length, not full message length
                 think_content = (
                     content.split("<think>")[-1].split("</think>")[0]
                     if "<think>" in content
@@ -407,23 +315,19 @@ def single_round_statistics(input_file, tokenizer):
                 )
                 think_lengths.append(len(think_content))
 
-                assistant_tokens = count_tokens_with_tokenizer(content, tokenizer)
+                assistant_tokens = count_tokens(content, tokenizer)
                 question_assistant_tokens += assistant_tokens
                 total_tokens += assistant_tokens
                 all_assistant_tokens_per_message.append(assistant_tokens)
             else:
-                # Bug 4 fix: count non-assistant tokens here to avoid re-tokenizing the whole conversation
-                total_tokens += count_tokens_with_tokenizer(msg["content"], tokenizer)
+                total_tokens += count_tokens(msg["content"], tokenizer)
 
         tool_use_cnt.append(num_tool_use)
         visit_tool_cnt.append(num_visit_tool)
         search_tool_cnt.append(num_search_tool)
         other_tool_cnt.append(num_other_tool)
-
         all_ans_lengths.append(answer_length)
-        think_length = sum(think_lengths) / len(think_lengths) if think_lengths else 0
-        all_think_lengths.append(think_length)
-
+        all_think_lengths.append(sum(think_lengths) / len(think_lengths) if think_lengths else 0)
         all_assistant_tokens_per_question.append(question_assistant_tokens)
 
         termination = get_termination_value(item)
@@ -433,10 +337,6 @@ def single_round_statistics(input_file, tokenizer):
             num_extra += 1
 
     total_questions = len(contents)
-    termination_freq = {
-        k: round(v / total_questions, 3) for k, v in termination_counts.items()
-    }
-
     return {
         "extra_length": num_extra,
         "num_invalid": num_invalid,
@@ -447,19 +347,36 @@ def single_round_statistics(input_file, tokenizer):
         "avg_ans_length": sum(all_ans_lengths) / len(all_ans_lengths),
         "avg_think_length": sum(all_think_lengths) / len(all_think_lengths),
         "avg_assistant_tokens_per_question": (
-            sum(all_assistant_tokens_per_question)
-            / len(all_assistant_tokens_per_question)
-            if all_assistant_tokens_per_question
-            else 0
+            sum(all_assistant_tokens_per_question) / len(all_assistant_tokens_per_question)
+            if all_assistant_tokens_per_question else 0
         ),
         "avg_assistant_tokens_per_message": (
-            sum(all_assistant_tokens_per_message)
-            / len(all_assistant_tokens_per_message)
-            if all_assistant_tokens_per_message
-            else 0
+            sum(all_assistant_tokens_per_message) / len(all_assistant_tokens_per_message)
+            if all_assistant_tokens_per_message else 0
         ),
-        "termination_freq": termination_freq,
+        "termination_freq": {
+            k: round(v / total_questions, 3) for k, v in termination_counts.items()
+        },
     }
+
+
+def aggregate_statistics(round1_file, round2_file, round3_file, tokenizer):
+    stats = [
+        single_round_statistics(f, tokenizer)
+        for f in [round1_file, round2_file, round3_file]
+    ]
+    keys = stats[0].keys()
+    avg_stats = {}
+    for key in keys:
+        if isinstance(stats[0][key], dict):
+            all_keys = set().union(*(s[key].keys() for s in stats))
+            avg_stats[key] = {
+                k: round(sum(s[key].get(k, 0) for s in stats) / 3, 3)
+                for k in all_keys
+            }
+        else:
+            avg_stats[key] = round(sum(s[key] for s in stats) / 3, 3)
+    return avg_stats
 
 
 def calculate_enhanced_statistics(round_results, round_items, tokenizer):
@@ -470,7 +387,6 @@ def calculate_enhanced_statistics(round_results, round_items, tokenizer):
         results = round_results[round_name]
         items = round_items[round_name]
 
-        # Build question→item index for O(1) lookup
         question_to_item = {}
         for item in items:
             try:
@@ -493,8 +409,6 @@ def calculate_enhanced_statistics(round_results, round_items, tokenizer):
             for msg in messages:
                 if msg["role"] == "assistant":
                     content = msg["content"]
-
-                    # Bug 2 fix: count actual tool calls, not assistant messages
                     remaining_content = content
                     while (
                         "<tool_call>" in remaining_content
@@ -511,37 +425,24 @@ def calculate_enhanced_statistics(round_results, round_items, tokenizer):
                             remaining_content = remaining_content[end_idx + 12 :]
                         else:
                             break
-
-                    # Bug 3 fix: count full content tokens (consistent with single_round_statistics)
-                    assistant_tokens = count_tokens_with_tokenizer(content, tokenizer)
-                    question_assistant_tokens += assistant_tokens
+                    question_assistant_tokens += count_tokens(content, tokenizer)
 
             correct_tool_calls.append(num_tool_use)
             correct_assistant_tokens.append(question_assistant_tokens)
 
-    avg_tool_calls_correct = (
-        sum(correct_tool_calls) / len(correct_tool_calls) if correct_tool_calls else 0
-    )
-    avg_assistant_tokens_correct = (
-        sum(correct_assistant_tokens) / len(correct_assistant_tokens)
-        if correct_assistant_tokens
-        else 0
-    )
-
     return {
         "avg_tool_calls_per_question_correctly_solved": round(
-            avg_tool_calls_correct, 3
+            sum(correct_tool_calls) / len(correct_tool_calls) if correct_tool_calls else 0, 3
         ),
         "avg_assistant_tokens_per_question_correctly_solved": round(
-            avg_assistant_tokens_correct, 3
+            sum(correct_assistant_tokens) / len(correct_assistant_tokens)
+            if correct_assistant_tokens else 0, 3
         ),
     }
 
 
 def aggregate_results(round1_results, round2_results, round3_results):
-    global dataset
     query_results = {}
-
     for results, round_name in zip(
         [round1_results, round2_results, round3_results], ["round1", "round2", "round3"]
     ):
@@ -554,62 +455,90 @@ def aggregate_results(round1_results, round2_results, round3_results):
                     "round3": None,
                     "answer": result["answer"],
                 }
-
             if is_correct_judgement(result["judgement"]):
                 query_results[query][round_name] = "Correct"
             else:
                 query_results[query][round_name] = result["judgement"].capitalize()
-
     return query_results
 
 
-def calculate_pass_at_k(query_results, k=10):
-    total_correct = 0
-
-    for query, results in query_results.items():
-        rounds = [results["round1"], results["round2"], results["round3"]][:k]
-
-        if "Correct" in rounds:
-            total_correct += 1
-
-    overall_pass = total_correct / len(query_results)
-    return round(overall_pass * 100, 2)
+def calculate_pass_at_k(query_results, k=3):
+    total_correct = sum(
+        1
+        for results in query_results.values()
+        if "Correct" in [results["round1"], results["round2"], results["round3"]][:k]
+    )
+    return round(total_correct / len(query_results) * 100, 2)
 
 
 def calculate_best_pass_at_1(query_results):
-    round_correct = {round_name: 0 for round_name in ["round1", "round2", "round3"]}
-
-    for query, results in query_results.items():
-        for round_name in ["round1", "round2", "round3"]:
-            if results[round_name] == "Correct":
-                round_correct[round_name] += 1
-
     overall_best = max(
-        round_correct[round_name] / len(query_results)
-        for round_name in ["round1", "round2", "round3"]
+        sum(1 for r in query_results.values() if r[rn] == "Correct") / len(query_results)
+        for rn in ["round1", "round2", "round3"]
     )
-
     return round(overall_best * 100, 2)
 
 
 def calculate_avg_pass_at_3(query_results):
     round_names = ["round1", "round2", "round3"]
-    total_correct = {round_name: 0 for round_name in round_names}
-
-    for query, results in query_results.items():
-        for round_name in round_names:
-            if results[round_name] == "Correct":
-                total_correct[round_name] += 1
-
-    avg_overall = sum(total_correct[r] / len(query_results) for r in round_names) / len(
-        round_names
-    )
-
+    avg_overall = sum(
+        sum(1 for r in query_results.values() if r[rn] == "Correct") / len(query_results)
+        for rn in round_names
+    ) / len(round_names)
     return round(avg_overall * 100, 2)
 
 
-def visualize_debug(items, judge_prompt, n=3):
-    """Print sample data and make one judge call to verify the pipeline."""
+# ── Auto-reuse existing scored files ───────────────────────────────────────────
+
+def _load_results_from_scored(scored_file):
+    """Reconstruct judge results list from an existing _scored.jsonl."""
+    results = []
+    with open(scored_file, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            results.append({
+                "question": item["question"],
+                "answer": item["answer"],
+                "judgement": item.get("judgement", "Error"),
+            })
+    return results
+
+
+def load_or_judge_round(jsonl_path, judge_prompt, dataset, round_name):
+    """Load existing _scored.jsonl if available, otherwise run judge and save."""
+    scored_path = jsonl_path.replace(".jsonl", "_scored.jsonl")
+    if os.path.exists(scored_path):
+        print(f"Loading existing {scored_path}")
+        return _load_results_from_scored(scored_path)
+
+    print(f"Judging {jsonl_path} ...")
+    items = process_single_round(jsonl_path)
+    results = run_judge_queue(items, judge_prompt, dataset, desc=f"Evaluating {round_name}")
+
+    # Save scored file
+    index_map = {item["question"]: i for i, item in enumerate(items)}
+    sorted_results = sorted(
+        results, key=lambda x: index_map.get(x["question"], float("inf"))
+    )
+    with open(scored_path, "w", encoding="utf-8") as f:
+        for orig_item, scored_result in zip(items, sorted_results):
+            scored_item = {
+                "is_correct": is_correct_judgement(scored_result["judgement"]),
+                "judgement": scored_result["judgement"],
+            }
+            if "error" in scored_result:
+                scored_item["error"] = scored_result["error"]
+            scored_item.update(orig_item)
+            f.write(json.dumps(scored_item, ensure_ascii=False) + "\n")
+
+    return results
+
+
+# ── Debug helper ───────────────────────────────────────────────────────────────
+
+def visualize_debug(items, judge_prompt, dataset, n=3):
     print("=" * 70)
     print(f"[DEBUG] Loaded {len(items)} items. Showing first {n}:")
     print("=" * 70)
@@ -631,7 +560,7 @@ def visualize_debug(items, judge_prompt, n=3):
     print("\n" + "=" * 70)
     print("[DEBUG] Calling judge for item 0...")
     print("=" * 70)
-    result = call_llm_judge(items[0])
+    result, _ = _judge_once(items[0], judge_prompt, dataset)
     print(f"  judgement  : {result.get('judgement')}")
     print(f"  is_correct : {is_correct_judgement(result.get('judgement', ''))}")
     if "error" in result:
@@ -641,8 +570,10 @@ def visualize_debug(items, judge_prompt, n=3):
     print("=" * 70)
 
 
+# ── Entry point ────────────────────────────────────────────────────────────────
+
 def main():
-    global judge_prompt, dataset, judge_model, MAX_JUDGE_RETRIES, MAX_WORKERS, JITTER
+    global MAX_JUDGE_RETRIES, MAX_WORKERS, JITTER, JUDGE_MODEL
     parser = argparse.ArgumentParser(
         description="Evaluate model predictions across multiple rounds"
     )
@@ -657,6 +588,7 @@ def main():
         choices=[
             "gaia",
             "browsecomp_zh",
+            "browsecomp_en",
             "browsecomp_en_full",
             "webwalker",
             "xbench-deepsearch",
@@ -677,56 +609,49 @@ def main():
         "--max_workers",
         type=int,
         default=MAX_WORKERS,
-        help="Number of parallel judge threads (default: %(default)s).",
     )
     parser.add_argument(
         "--max_retries",
         type=int,
         default=MAX_JUDGE_RETRIES,
-        help="Max retry attempts per judge call (default: %(default)s).",
     )
     parser.add_argument(
         "--jitter",
         type=float,
         default=JITTER,
-        help="Retry backoff jitter as a fraction, e.g. 0.25 means ±25%% (default: %(default)s).",
     )
     parser.add_argument(
         "--max_calls_per_minute",
         type=int,
         default=MAX_CALLS_PER_MINUTE,
-        help="Max API calls per minute via sliding window (default: %(default)s).",
     )
+    parser.add_argument("--judge_model", type=str, default=JUDGE_MODEL)
     args = parser.parse_args()
 
     MAX_JUDGE_RETRIES = args.max_retries
     MAX_WORKERS = args.max_workers
     JITTER = args.jitter
     rate_limiter._max_calls = args.max_calls_per_minute
+    JUDGE_MODEL = args.judge_model
 
     dataset = args.dataset
-    judge_model = JUDGE_MODEL_LITELLM
     if dataset in ["gaia", "webwalker"]:
         judge_prompt = JUDGE_PROMPT_GAIA
-    elif dataset in ["xbench-deepsearch"]:
+    elif dataset == "xbench-deepsearch":
         judge_prompt = JUDGE_PROMPT_XBENCH
-    elif dataset.startswith("browsecomp_zh") or dataset.startswith("browsecomp_en"):
+    elif dataset.startswith("browsecomp"):
         judge_prompt = JUDGE_PROMPT_BROWSECOMP_OFFICIAL
     else:
         judge_prompt = JUDGE_PROMPT_GAIA
     print(f"Using {dataset} judge prompt ...")
     print(f"Judge prompt:\n {judge_prompt}")
-    print(f"Judge model:\n {judge_model}")
+    print(f"Judge model:\n {JUDGE_MODEL}")
 
-    round1_file, round2_file, round3_file = (
-        os.path.join(args.input_folder, "iter1.jsonl"),
-        os.path.join(args.input_folder, "iter2.jsonl"),
-        os.path.join(args.input_folder, "iter3.jsonl"),
-    )
+    round1_file = os.path.join(args.input_folder, "iter1.jsonl")
+    round2_file = os.path.join(args.input_folder, "iter2.jsonl")
+    round3_file = os.path.join(args.input_folder, "iter3.jsonl")
     for file in [round1_file, round2_file, round3_file]:
-        assert os.path.exists(
-            file
-        ), f"Prediction {file} not found, three  rounds are required "
+        assert os.path.exists(file), f"Prediction {file} not found, three rounds are required"
 
     round_items = {
         "round1": process_single_round(round1_file),
@@ -734,60 +659,34 @@ def main():
         "round3": process_single_round(round3_file),
     }
 
-    # Bug 5 fix: load tokenizer once and pass to all statistics functions
+    # Load tokenizer (fall back to tiktoken or char-count)
     try:
         tokenizer = AutoTokenizer.from_pretrained(os.getenv("TOKENIZER_PATH", ""))
     except Exception:
-        tokenizer = tiktoken.encoding_for_model("gpt-4o")
+        if tiktoken is not None:
+            tokenizer = tiktoken.encoding_for_model("gpt-4o")
+        else:
+            tokenizer = None
 
     if args.debug:
-        litellm._turn_on_debug()
         debug_items = round_items.get("round1", [])
         if not debug_items:
             print("[DEBUG] No items found in round1. Check --input_folder path.")
         else:
-            visualize_debug(debug_items, judge_prompt, n=args.debug_n)
+            visualize_debug(debug_items, judge_prompt, dataset, n=args.debug_n)
         return
 
-    round_results = {}
+    # ── Judge (or load existing scored files) ──
+    round_results = {
+        "round1": load_or_judge_round(round1_file, judge_prompt, dataset, "round1"),
+        "round2": load_or_judge_round(round2_file, judge_prompt, dataset, "round2"),
+        "round3": load_or_judge_round(round3_file, judge_prompt, dataset, "round3"),
+    }
 
-    for round_name, items in round_items.items():
-        round_results[round_name] = run_judge_queue(
-            items, desc=f"Evaluating {round_name}"
-        )
-
-    for round_name in ["round1", "round2", "round3"]:
-        input_file = {
-            "round1": round1_file,
-            "round2": round2_file,
-            "round3": round3_file,
-        }[round_name]
-        scored_file = input_file.replace(".jsonl", "_scored.jsonl")
-        original_items = round_items[round_name]
-
-        # Bug 6 fix: use index dict to avoid O(n²) sorting
-        index_map = {item["question"]: i for i, item in enumerate(original_items)}
-        sorted_results = sorted(
-            round_results[round_name],
-            key=lambda x: index_map.get(x["question"], float("inf")),
-        )
-
-        with open(scored_file, "w", encoding="utf-8") as f:
-            for orig_item, scored_result in zip(original_items, sorted_results):
-                scored_item = {
-                    "is_correct": is_correct_judgement(scored_result["judgement"]),
-                    "judgement": scored_result["judgement"],
-                }
-                if "error" in scored_result:
-                    scored_item["error"] = scored_result["error"]
-
-                scored_item.update(orig_item)
-                f.write(json.dumps(scored_item, ensure_ascii=False) + "\n")
-
+    # ── Pass@k metrics ──
     aggr_results = aggregate_results(
         round_results["round1"], round_results["round2"], round_results["round3"]
     )
-
     pass_at_3 = calculate_pass_at_k(aggr_results, k=3)
     best_pass_at_1 = calculate_best_pass_at_1(aggr_results)
     avg_pass_at_3 = calculate_avg_pass_at_3(aggr_results)
@@ -811,38 +710,45 @@ def main():
     print(f"Best Pass@1 {best_pass_at_1}%")
     print(f"Pass@3 {pass_at_3}%")
     print(
-        f"Pass@1 Round 1: {round_performance['Round1_Pass@1']}%  Round 2: {round_performance['Round2_Pass@1']}%  Round 3: {round_performance['Round3_Pass@1']}% \n"
+        f"Pass@1 Round 1: {round_performance['Round1_Pass@1']}%  "
+        f"Round 2: {round_performance['Round2_Pass@1']}%  "
+        f"Round 3: {round_performance['Round3_Pass@1']}%\n"
     )
 
-    aggr_statistics = aggregate_statistics(
-        round1_file, round2_file, round3_file, tokenizer
-    )
+    # ── Statistics ──
+    aggr_statistics = aggregate_statistics(round1_file, round2_file, round3_file, tokenizer)
     print(
         f"# Invalid {aggr_statistics['num_invalid']}  # Extra Length {aggr_statistics['extra_length']}"
     )
     print(
-        f"Avg. Action {aggr_statistics['avg_action']:.2f}  Avg. Visit Action {aggr_statistics['avg_visit_action']:.2f}  Avg. Search Action {aggr_statistics['avg_search_action']:.2f}  Avg. Other Action {aggr_statistics['avg_other_action']:.2f}"
+        f"Avg. Action {aggr_statistics['avg_action']:.2f}  "
+        f"Avg. Visit Action {aggr_statistics['avg_visit_action']:.2f}  "
+        f"Avg. Search Action {aggr_statistics['avg_search_action']:.2f}  "
+        f"Avg. Other Action {aggr_statistics['avg_other_action']:.2f}"
     )
     print(
-        f"Avg. Answer Length {aggr_statistics['avg_ans_length']:.2f}  Avg. Thinking Length {aggr_statistics['avg_think_length']:.2f}"
+        f"Avg. Answer Length {aggr_statistics['avg_ans_length']:.2f}  "
+        f"Avg. Thinking Length {aggr_statistics['avg_think_length']:.2f}"
     )
-    enhanced_statistics = calculate_enhanced_statistics(
-        round_results, round_items, tokenizer
-    )
+
+    enhanced_statistics = calculate_enhanced_statistics(round_results, round_items, tokenizer)
     print(f"\n=== ADDITIONAL STATISTICS ===")
-    # Bug 7 fix: avg_action == avg_tool_calls_per_question (removed duplicate); use avg_action
     print(f"Avg. Tool Calls per Question: {aggr_statistics['avg_action']:.2f}")
     print(
-        f"Avg. Tool Calls per Question (Correctly Solved): {enhanced_statistics['avg_tool_calls_per_question_correctly_solved']:.2f}"
+        f"Avg. Tool Calls per Question (Correctly Solved): "
+        f"{enhanced_statistics['avg_tool_calls_per_question_correctly_solved']:.2f}"
     )
     print(
-        f"Avg. Assistant Tokens per Question: {aggr_statistics['avg_assistant_tokens_per_question']:.2f}"
+        f"Avg. Assistant Tokens per Question: "
+        f"{aggr_statistics['avg_assistant_tokens_per_question']:.2f}"
     )
     print(
-        f"Avg. Assistant Tokens per Question (Correctly Solved): {enhanced_statistics['avg_assistant_tokens_per_question_correctly_solved']:.2f}"
+        f"Avg. Assistant Tokens per Question (Correctly Solved): "
+        f"{enhanced_statistics['avg_assistant_tokens_per_question_correctly_solved']:.2f}"
     )
     print(
-        f"Avg. Assistant Tokens per Message: {aggr_statistics['avg_assistant_tokens_per_message']:.2f}"
+        f"Avg. Assistant Tokens per Message: "
+        f"{aggr_statistics['avg_assistant_tokens_per_message']:.2f}"
     )
 
     print(f"\n=== TERMINATION FREQUENCIES ===")
@@ -865,10 +771,10 @@ def main():
 
     with open(args.restore_result_path, "a", encoding="utf-8") as jsonl_file:
         jsonl_file.write(json.dumps(overall_eval_dict, ensure_ascii=False) + "\n")
+    print(f"\nSummary appended to {args.restore_result_path}")
 
 
 if __name__ == "__main__":
-    judge_prompt, dataset = None, ""
     try:
         main()
     except Exception as e:
