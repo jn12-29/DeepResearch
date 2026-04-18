@@ -12,9 +12,9 @@ if [ ! -f "$ENV_FILE" ]; then
 fi
 
 echo "Loading environment variables from .env file..."
-set -a  # automatically export all variables
+set -a
 source "$ENV_FILE"
-set +a  # stop automatically exporting
+set +a
 
 # =============================================================================
 # Configuration
@@ -25,17 +25,21 @@ MAX_WORKERS="${MAX_WORKERS:-10}"
 
 if [ -z "$INPUT_FP" ]; then
     echo "Error: input path not specified."
-    echo "Usage: bash evaluation/run_hle.sh <input_folder_or_file> [tokenizer_path]"
+    echo "Usage: bash evaluation/run_hle.sh <input_folder_or_file> [tokenizer_path] [extra_args...]"
+    echo "  extra_args: --judge_model <model> --base_url <url> --max_workers <n> ..."
     echo "  Or set OUTPUT_PATH in .env"
     exit 1
 fi
 
 if [ -z "$TOKENIZER_PATH" ]; then
     echo "Error: tokenizer path not specified."
-    echo "Usage: bash evaluation/run_hle.sh <input_folder_or_file> <tokenizer_path>"
+    echo "Usage: bash evaluation/run_hle.sh <input_folder_or_file> <tokenizer_path> [extra_args...]"
     echo "  Or set MODEL_PATH in .env"
     exit 1
 fi
+
+# Consume the two positional args; everything else is forwarded to Python
+[[ $# -ge 2 ]] && shift 2 || shift $#
 
 # =============================================================================
 # Run evaluation
@@ -48,14 +52,13 @@ run_eval() {
     python evaluation/evaluate_hle_official.py \
         --input_fp "$jsonl_file" \
         --tokenizer_path "$TOKENIZER_PATH" \
-        --max_workers "$MAX_WORKERS"
+        --max_workers "$MAX_WORKERS" \
+        "$@"
 }
 
 if [ -f "$INPUT_FP" ]; then
-    # Single file
-    run_eval "$INPUT_FP"
+    run_eval "$INPUT_FP" "$@"
 elif [ -d "$INPUT_FP" ]; then
-    # Directory: iterate over all iter*.jsonl files in order
     shopt -s nullglob
     files=("$INPUT_FP"/iter*.jsonl)
     if [ ${#files[@]} -eq 0 ]; then
@@ -64,7 +67,7 @@ elif [ -d "$INPUT_FP" ]; then
     fi
     echo "Found ${#files[@]} file(s) to evaluate in $INPUT_FP"
     for f in "${files[@]}"; do
-        run_eval "$f"
+        run_eval "$f" "$@"
     done
 else
     echo "Error: $INPUT_FP is not a valid file or directory"

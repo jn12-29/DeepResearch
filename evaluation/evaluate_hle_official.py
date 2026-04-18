@@ -1,4 +1,8 @@
 import os
+
+os.environ["OPENAI_API_KEY"] = os.getenv("API_KEY", "")
+os.environ["OPENAI_API_BASE"] = os.getenv("API_BASE", "")
+
 from pydantic import BaseModel
 from typing import Literal
 import json
@@ -8,6 +12,7 @@ import threading
 from collections import Counter
 from transformers import AutoTokenizer
 import argparse
+
 try:
     import tiktoken
 except ImportError:
@@ -26,7 +31,7 @@ JUDGE_MODEL = "qwen-flash-2025-07-28"
 MAX_WORKERS = 5
 MAX_RETRIES = 100
 JITTER = 0.5
-MAX_CALLS_PER_MINUTE = 30
+MAX_CALLS_PER_MINUTE = 3000
 
 rate_limiter = SlidingWindowRateLimiter(MAX_CALLS_PER_MINUTE)
 
@@ -152,16 +157,18 @@ def _queue_worker(q, results, lock, pending, pbar, tokenizer):
             else:
                 print(f"Max retries exceeded: {item['question'][:60]}: {exc}")
             with lock:
-                results.append({
-                    "acc": 0,
-                    "turns": 0,
-                    "token_usage": "",
-                    "tool_usage": Counter(),
-                    "item": item,
-                    "context_length": 0,
-                    "dollars_o4mini": 0,
-                    "is_answer": 0,
-                })
+                results.append(
+                    {
+                        "acc": 0,
+                        "turns": 0,
+                        "token_usage": "",
+                        "tool_usage": Counter(),
+                        "item": item,
+                        "context_length": 0,
+                        "dollars_o4mini": 0,
+                        "is_answer": 0,
+                    }
+                )
                 pending[0] -= 1
                 pbar.update(1)
         else:
@@ -207,6 +214,7 @@ def run_process_queue(items, tokenizer):
 
 # ── Statistics helpers (aligned with evaluate_deepsearch_official.py) ──────────
 
+
 def get_termination_value(item):
     if "termination" in item:
         return item["termination"]
@@ -246,7 +254,9 @@ def single_round_statistics(items, tokenizer):
             num_invalid += 1
             answer_length = 0
         else:
-            answer_length = len(final_msg.split("<answer>")[1].split("</answer>")[0].strip())
+            answer_length = len(
+                final_msg.split("<answer>")[1].split("</answer>")[0].strip()
+            )
 
         num_tool_use, num_visit_tool, num_search_tool, num_other_tool = 0, 0, 0, 0
         think_lengths = []
@@ -261,7 +271,7 @@ def single_round_statistics(items, tokenizer):
                     s = remaining.find("<tool_call>")
                     e = remaining.find("</tool_call>")
                     if s != -1 and e != -1 and e > s:
-                        tc = remaining[s + 11:e].strip()
+                        tc = remaining[s + 11 : e].strip()
                         if tc:
                             num_tool_use += 1
                             try:
@@ -279,13 +289,14 @@ def single_round_statistics(items, tokenizer):
                                     num_search_tool += 1
                                 else:
                                     num_other_tool += 1
-                        remaining = remaining[e + 12:]
+                        remaining = remaining[e + 12 :]
                     else:
                         break
 
                 think_content = (
                     content.split("<think>")[-1].split("</think>")[0]
-                    if "<think>" in content else content
+                    if "<think>" in content
+                    else content
                 )
                 think_lengths.append(len(think_content))
 
@@ -301,7 +312,9 @@ def single_round_statistics(items, tokenizer):
         search_tool_cnt.append(num_search_tool)
         other_tool_cnt.append(num_other_tool)
         all_ans_lengths.append(answer_length)
-        all_think_lengths.append(sum(think_lengths) / len(think_lengths) if think_lengths else 0)
+        all_think_lengths.append(
+            sum(think_lengths) / len(think_lengths) if think_lengths else 0
+        )
         all_assistant_tokens_per_question.append(question_assistant_tokens)
 
         termination = get_termination_value(item)
@@ -321,19 +334,26 @@ def single_round_statistics(items, tokenizer):
         "avg_ans_length": sum(all_ans_lengths) / n,
         "avg_think_length": sum(all_think_lengths) / n,
         "avg_assistant_tokens_per_question": (
-            sum(all_assistant_tokens_per_question) / len(all_assistant_tokens_per_question)
-            if all_assistant_tokens_per_question else 0
+            sum(all_assistant_tokens_per_question)
+            / len(all_assistant_tokens_per_question)
+            if all_assistant_tokens_per_question
+            else 0
         ),
         "avg_assistant_tokens_per_message": (
-            sum(all_assistant_tokens_per_message) / len(all_assistant_tokens_per_message)
-            if all_assistant_tokens_per_message else 0
+            sum(all_assistant_tokens_per_message)
+            / len(all_assistant_tokens_per_message)
+            if all_assistant_tokens_per_message
+            else 0
         ),
         "termination_freq": {k: round(v / n, 3) for k, v in termination_counts.items()},
     }
 
 
 def aggregate_statistics(round_items_dict, tokenizer):
-    stats = {rn: single_round_statistics(items, tokenizer) for rn, items in round_items_dict.items()}
+    stats = {
+        rn: single_round_statistics(items, tokenizer)
+        for rn, items in round_items_dict.items()
+    }
     keys = list(next(iter(stats.values())).keys())
     avg = {}
     for key in keys:
@@ -379,9 +399,9 @@ def calculate_enhanced_statistics(round_results, round_items_dict, tokenizer):
                     s = remaining.find("<tool_call>")
                     e = remaining.find("</tool_call>")
                     if s != -1 and e != -1 and e > s:
-                        if remaining[s + 11:e].strip():
+                        if remaining[s + 11 : e].strip():
                             num_tool_use += 1
-                        remaining = remaining[e + 12:]
+                        remaining = remaining[e + 12 :]
                     else:
                         break
                 question_assistant_tokens += count_tokens(content, tokenizer)
@@ -391,16 +411,26 @@ def calculate_enhanced_statistics(round_results, round_items_dict, tokenizer):
 
     return {
         "avg_tool_calls_per_question_correctly_solved": round(
-            sum(correct_tool_calls) / len(correct_tool_calls) if correct_tool_calls else 0, 3
+            (
+                sum(correct_tool_calls) / len(correct_tool_calls)
+                if correct_tool_calls
+                else 0
+            ),
+            3,
         ),
         "avg_assistant_tokens_per_question_correctly_solved": round(
-            sum(correct_assistant_tokens) / len(correct_assistant_tokens)
-            if correct_assistant_tokens else 0, 3
+            (
+                sum(correct_assistant_tokens) / len(correct_assistant_tokens)
+                if correct_assistant_tokens
+                else 0
+            ),
+            3,
         ),
     }
 
 
 # ── Pass@k helpers ──────────────────────────────────────────────────────────────
+
 
 def build_query_results(round_results):
     """Map question → {round1: 'Correct'|other, round2: ..., round3: ..., answer: str}."""
@@ -417,7 +447,8 @@ def build_query_results(round_results):
 
 def calculate_pass_at_k(query_results, round_names, k=3):
     total = sum(
-        1 for v in query_results.values()
+        1
+        for v in query_results.values()
         if "Correct" in [v[rn] for rn in round_names[:k]]
     )
     return round(total / len(query_results) * 100, 2)
@@ -425,7 +456,8 @@ def calculate_pass_at_k(query_results, round_names, k=3):
 
 def calculate_best_pass_at_1(query_results, round_names):
     best = max(
-        sum(1 for v in query_results.values() if v[rn] == "Correct") / len(query_results)
+        sum(1 for v in query_results.values() if v[rn] == "Correct")
+        / len(query_results)
         for rn in round_names
     )
     return round(best * 100, 2)
@@ -433,13 +465,15 @@ def calculate_best_pass_at_1(query_results, round_names):
 
 def calculate_avg_pass_at_n(query_results, round_names):
     avg = sum(
-        sum(1 for v in query_results.values() if v[rn] == "Correct") / len(query_results)
+        sum(1 for v in query_results.values() if v[rn] == "Correct")
+        / len(query_results)
         for rn in round_names
     ) / len(round_names)
     return round(avg * 100, 2)
 
 
 # ── Single-file mode (backward compat) ─────────────────────────────────────────
+
 
 def run_single_file(input_fp, tokenizer, repeat_times=1):
     d = load_jsonl(input_fp) * repeat_times
@@ -465,6 +499,7 @@ def run_single_file(input_fp, tokenizer, repeat_times=1):
 
 # ── Folder mode ─────────────────────────────────────────────────────────────────
 
+
 def load_or_judge_round(jsonl_path, eval_details_path, tokenizer):
     """Load existing eval_details if available, otherwise run judge and save."""
     if os.path.exists(eval_details_path):
@@ -480,8 +515,7 @@ def load_or_judge_round(jsonl_path, eval_details_path, tokenizer):
 
 def run_folder_mode(input_folder, tokenizer, restore_result_path):
     round_files = {
-        f"round{i}": os.path.join(input_folder, f"iter{i}.jsonl")
-        for i in [1, 2, 3]
+        f"round{i}": os.path.join(input_folder, f"iter{i}.jsonl") for i in [1, 2, 3]
     }
     for rn, fp in round_files.items():
         assert os.path.exists(fp), f"{fp} not found; all 3 rounds are required"
@@ -492,7 +526,9 @@ def run_folder_mode(input_folder, tokenizer, restore_result_path):
     round_results = {}
     for rn, jsonl_path in round_files.items():
         eval_details_path = jsonl_path.replace(".jsonl", ".eval_details.jsonl")
-        round_results[rn] = load_or_judge_round(jsonl_path, eval_details_path, tokenizer)
+        round_results[rn] = load_or_judge_round(
+            jsonl_path, eval_details_path, tokenizer
+        )
 
     # Load original items for statistics
     round_items = {rn: load_jsonl(fp) for rn, fp in round_files.items()}
@@ -505,7 +541,9 @@ def run_folder_mode(input_folder, tokenizer, restore_result_path):
     round_performance = {
         f"Round{i}_Pass@1": round(
             sum(1 for r in round_results[f"round{i}"] if r["acc"] == 1)
-            / len(round_results[f"round{i}"]) * 100, 2
+            / len(round_results[f"round{i}"])
+            * 100,
+            2,
         )
         for i in [1, 2, 3]
     }
@@ -584,21 +622,41 @@ def run_folder_mode(input_folder, tokenizer, restore_result_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Folder mode (3-round Pass@k evaluation)
-    parser.add_argument("--input_folder", type=str, default="",
-                        help="Folder containing iter1/2/3.jsonl; enables Pass@k mode")
-    parser.add_argument("--restore_result_path", type=str, default="summary.jsonl",
-                        help="JSONL file to append the summary report to")
+    parser.add_argument(
+        "--input_folder",
+        type=str,
+        default="",
+        help="Folder containing iter1/2/3.jsonl; enables Pass@k mode",
+    )
+    parser.add_argument(
+        "--restore_result_path",
+        type=str,
+        default="summary.jsonl",
+        help="JSONL file to append the summary report to",
+    )
     # Single-file mode (backward compat)
-    parser.add_argument("--input_fp", type=str, default="",
-                        help="Single JSONL file for one-round evaluation")
+    parser.add_argument(
+        "--input_fp",
+        type=str,
+        default="",
+        help="Single JSONL file for one-round evaluation",
+    )
     parser.add_argument("--repeat_times", type=int, default=1)
     # Common
     parser.add_argument("--tokenizer_path", type=str, default="")
     parser.add_argument("--max_workers", type=int, default=MAX_WORKERS)
     parser.add_argument("--max_retries", type=int, default=MAX_RETRIES)
     parser.add_argument("--jitter", type=float, default=JITTER)
-    parser.add_argument("--max_calls_per_minute", type=int, default=MAX_CALLS_PER_MINUTE)
+    parser.add_argument(
+        "--max_calls_per_minute", type=int, default=MAX_CALLS_PER_MINUTE
+    )
     parser.add_argument("--judge_model", type=str, default=JUDGE_MODEL)
+    parser.add_argument(
+        "--base_url",
+        type=str,
+        default="",
+        help="Override API_BASE for the judge model endpoint",
+    )
 
     args = parser.parse_args()
     MAX_WORKERS = args.max_workers
@@ -606,6 +664,11 @@ if __name__ == "__main__":
     JITTER = args.jitter
     rate_limiter._max_calls = args.max_calls_per_minute
     JUDGE_MODEL = args.judge_model
+
+    import judge_utils as _ju
+
+    if args.base_url:
+        _ju.BASE_URL = args.base_url
 
     # Load tokenizer (fall back to tiktoken or char-count)
     if args.tokenizer_path:

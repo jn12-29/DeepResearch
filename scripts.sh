@@ -58,12 +58,14 @@ tail -f logs/infer_*.log
 ---
 
 CUDA_VISIBLE_DEVICES=6,7 python quant.py
+pip install -U vllm --pre \
+  --extra-index-url https://wheels.vllm.ai/nightly/cu129 \
+  --extra-index-url https://download.pytorch.org/whl/cu129
+pip install transformers==5.5.0
 
-
-auto-round \
-  --model Tongyi-DeepResearch-30B-A3B \
-  --scheme W4A16 \
-  --iters 0 \
-  --group_size 128 \
-  --format auto_gptq \
-  --output_dir Tongyi-DeepResearch-30B-A3B-RTN-W4A16
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 vllm serve /home/xh/DeepResearch/models/Qwen3-30B-A3B-Instruct-2507 \
+  --served-model-name Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --max-model-len 64k \
+  --data-parallel-size 6 \
+  --host 127.0.0.1 \
+  --port 8000
