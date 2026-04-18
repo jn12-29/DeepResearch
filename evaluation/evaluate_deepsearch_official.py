@@ -23,17 +23,7 @@ from judge_utils import (
     _rate_limit_delay,
 )
 
-MAX_JUDGE_RETRIES = 100
-MAX_WORKERS = 64
-JITTER = 0.5
-MAX_CALLS_PER_MINUTE = 3000
-
-rate_limiter = SlidingWindowRateLimiter(MAX_CALLS_PER_MINUTE)
-
-os.environ["OPENAI_API_KEY"] = os.getenv("API_KEY", "")
-os.environ["OPENAI_API_BASE"] = os.getenv("API_BASE", "")
-
-JUDGE_MODEL = "qwen-flash-2025-07-28"
+rate_limiter = None  # initialized in main() after arg parsing
 
 
 extracted_answer_format_for_confidence = {
@@ -599,7 +589,6 @@ def visualize_debug(items, judge_prompt, dataset, n=3):
 
 
 def main():
-    global MAX_JUDGE_RETRIES, MAX_WORKERS, JITTER, JUDGE_MODEL
     parser = argparse.ArgumentParser(
         description="Evaluate model predictions across multiple rounds"
     )
@@ -631,45 +620,38 @@ def main():
         default=3,
         help="Number of sample items to display in debug mode.",
     )
-    parser.add_argument(
-        "--max_workers",
-        type=int,
-        default=MAX_WORKERS,
-    )
-    parser.add_argument(
-        "--max_retries",
-        type=int,
-        default=MAX_JUDGE_RETRIES,
-    )
-    parser.add_argument(
-        "--jitter",
-        type=float,
-        default=JITTER,
-    )
-    parser.add_argument(
-        "--max_calls_per_minute",
-        type=int,
-        default=MAX_CALLS_PER_MINUTE,
-    )
-    parser.add_argument("--judge_model", type=str, default=JUDGE_MODEL)
+    parser.add_argument("--max_workers", type=int, default=64)
+    parser.add_argument("--max_retries", type=int, default=100)
+    parser.add_argument("--jitter", type=float, default=0.5)
+    parser.add_argument("--max_calls_per_minute", type=int, default=3000)
+    parser.add_argument("--judge_model", type=str, default="qwen-flash-2025-07-28")
     parser.add_argument(
         "--base_url",
         type=str,
         default="",
         help="Override API_BASE for the judge model endpoint",
     )
+    parser.add_argument(
+        "--api_key",
+        type=str,
+        default="",
+        help="Override API_KEY for the judge model",
+    )
     args = parser.parse_args()
 
+    global MAX_JUDGE_RETRIES, MAX_WORKERS, JITTER, JUDGE_MODEL, rate_limiter
     MAX_JUDGE_RETRIES = args.max_retries
     MAX_WORKERS = args.max_workers
     JITTER = args.jitter
-    rate_limiter._max_calls = args.max_calls_per_minute
     JUDGE_MODEL = args.judge_model
+    rate_limiter = SlidingWindowRateLimiter(args.max_calls_per_minute)
 
     import judge_utils as _ju
 
     if args.base_url:
         _ju.BASE_URL = args.base_url
+    if args.api_key:
+        _ju.API_KEY = args.api_key
 
     dataset = args.dataset
     if dataset in ["gaia", "webwalker"]:

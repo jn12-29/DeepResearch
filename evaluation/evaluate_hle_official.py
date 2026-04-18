@@ -1,8 +1,5 @@
 import os
 
-os.environ["OPENAI_API_KEY"] = os.getenv("API_KEY", "")
-os.environ["OPENAI_API_BASE"] = os.getenv("API_BASE", "")
-
 from pydantic import BaseModel
 from typing import Literal
 import json
@@ -27,13 +24,7 @@ from judge_utils import (
     _rate_limit_delay,
 )
 
-JUDGE_MODEL = "qwen-flash-2025-07-28"
-MAX_WORKERS = 5
-MAX_RETRIES = 100
-JITTER = 0.5
-MAX_CALLS_PER_MINUTE = 3000
-
-rate_limiter = SlidingWindowRateLimiter(MAX_CALLS_PER_MINUTE)
+rate_limiter = None  # initialized in __main__ after arg parsing
 
 
 def load_jsonl(fp):
@@ -644,31 +635,37 @@ if __name__ == "__main__":
     parser.add_argument("--repeat_times", type=int, default=1)
     # Common
     parser.add_argument("--tokenizer_path", type=str, default="")
-    parser.add_argument("--max_workers", type=int, default=MAX_WORKERS)
-    parser.add_argument("--max_retries", type=int, default=MAX_RETRIES)
-    parser.add_argument("--jitter", type=float, default=JITTER)
-    parser.add_argument(
-        "--max_calls_per_minute", type=int, default=MAX_CALLS_PER_MINUTE
-    )
-    parser.add_argument("--judge_model", type=str, default=JUDGE_MODEL)
+    parser.add_argument("--max_workers", type=int, default=5)
+    parser.add_argument("--max_retries", type=int, default=100)
+    parser.add_argument("--jitter", type=float, default=0.5)
+    parser.add_argument("--max_calls_per_minute", type=int, default=3000)
+    parser.add_argument("--judge_model", type=str, default="qwen-flash-2025-07-28")
     parser.add_argument(
         "--base_url",
         type=str,
         default="",
         help="Override API_BASE for the judge model endpoint",
     )
+    parser.add_argument(
+        "--api_key",
+        type=str,
+        default="",
+        help="Override API_KEY for the judge model",
+    )
 
     args = parser.parse_args()
     MAX_WORKERS = args.max_workers
     MAX_RETRIES = args.max_retries
     JITTER = args.jitter
-    rate_limiter._max_calls = args.max_calls_per_minute
     JUDGE_MODEL = args.judge_model
+    rate_limiter = SlidingWindowRateLimiter(args.max_calls_per_minute)
 
     import judge_utils as _ju
 
     if args.base_url:
         _ju.BASE_URL = args.base_url
+    if args.api_key:
+        _ju.API_KEY = args.api_key
 
     # Load tokenizer (fall back to tiktoken or char-count)
     if args.tokenizer_path:

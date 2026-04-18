@@ -26,7 +26,7 @@ MAX_WORKERS="${MAX_WORKERS:-10}"
 if [ -z "$INPUT_FP" ]; then
     echo "Error: input path not specified."
     echo "Usage: bash evaluation/run_hle.sh <input_folder_or_file> [tokenizer_path] [extra_args...]"
-    echo "  extra_args: --judge_model <model> --base_url <url> --max_workers <n> ..."
+    echo "  extra_args: --judge_model <model> --base_url <url> --api_key <key> --max_workers <n> ..."
     echo "  Or set OUTPUT_PATH in .env"
     exit 1
 fi
@@ -41,6 +41,11 @@ fi
 # Consume the two positional args; everything else is forwarded to Python
 [[ $# -ge 2 ]] && shift 2 || shift $#
 
+# Build extra args from environment variables (can be overridden by $@)
+ENV_ARGS=()
+[ -n "$API_KEY" ]  && ENV_ARGS+=(--api_key  "$API_KEY")
+[ -n "$API_BASE" ] && ENV_ARGS+=(--base_url "$API_BASE")
+
 # =============================================================================
 # Run evaluation
 # =============================================================================
@@ -53,6 +58,7 @@ run_eval() {
         --input_fp "$jsonl_file" \
         --tokenizer_path "$TOKENIZER_PATH" \
         --max_workers "$MAX_WORKERS" \
+        "${ENV_ARGS[@]}" \
         "$@"
 }
 
