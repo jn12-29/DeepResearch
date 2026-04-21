@@ -87,10 +87,65 @@ The repo contains predecessor research agents as reference implementations:
 - **WebResummer** — Context summarization agent
 - **WebWatcher** — Vision-language deep research agent
 
-### OpenRouter Usage
+## Evaluation Results (`inference/outputs/` & `summary.jsonl`)
 
-To use OpenRouter instead of a local model, edit `inference/react_agent.py`:
+### Models Evaluated
 
-1. Set API key/base to OpenRouter credentials in `call_server()`
-2. Change model name to `alibaba/tongyi-deepresearch-30b-a3b`
-3. Uncomment lines 87–88 to prepend `reasoning_content` to `content`
+| Directory | Model |
+|-----------|-------|
+| `Tongyi-DeepResearch-30B-A3B_sglang` | FP16 full-precision |
+| `Tongyi-DeepResearch-30B-A3B-Int4-W4A16_sglang` | Int4 W4A16 quantized |
+
+### Datasets
+
+| Dataset key | Directory | Description |
+|-------------|-----------|-------------|
+| `xbench-deepsearch` | `DeepSearch-2510` | 2510-question Chinese deep search benchmark |
+| `gaia` | `gaia_2023_validation` | GAIA 2023 validation set |
+| `hle` | `hle_text_200` | Humanity's Last Exam, 200 text-only questions |
+
+### Directory Layout
+
+```
+inference/outputs/<model>/<dataset>/
+    iter{N}.jsonl              # Raw inference output
+    iter{N}_scored.jsonl       # Scored (DeepSearch / GAIA); adds is_correct, judgement
+    iter{N}.eval_details.jsonl # Detailed eval metadata (HLE); fields: acc, turns,
+                               #   token_usage, tool_usage, item, context_length,
+                               #   dollars_o4mini, is_answer
+    statistics.md              # Optional human-readable stats summary
+```
+
+Timestamped sibling directories (e.g. `DeepSearch-2510_20260418_205255`) contain **re-scored results** using a different judge model or evaluation method on the **same inference outputs** — the questions and model predictions are identical across base and timestamped directories.
+
+### `summary.jsonl` Schema
+
+Each line is a JSON object representing one evaluation run (model × dataset × judge):
+
+```jsonc
+{
+  "dataset": "xbench-deepsearch" | "gaia" | "hle",
+  "files": { "round1": "…/iter1.jsonl", "round2": "…/iter2.jsonl", "round3": "…/iter3.jsonl" },
+  "overall": {
+    "avg_pass_at_3": float,   // mean of 3 rounds' Pass@1
+    "best_pass_at_1": float,  // best single-round Pass@1
+    "pass_at_3": float        // oracle: correct if any round correct
+  },
+  "individual": { "Round1_Pass@1": float, "Round2_Pass@1": float, "Round3_Pass@1": float },
+  "statistics": {
+    "avg_action": float,                // total tool calls per question
+    "avg_search_action": float,
+    "avg_visit_action": float,
+    "avg_other_action": float,
+    "avg_ans_length": float,            // tokens in final answer
+    "avg_think_length": float,
+    "avg_assistant_tokens_per_question": float,
+    "avg_assistant_tokens_per_message": float,
+    "termination_freq": { "<reason>": float, … },
+    "num_invalid": float,
+    "extra_length": float,
+    "avg_tool_calls_per_question_correctly_solved": float,
+    "avg_assistant_tokens_per_question_correctly_solved": float
+  }
+}
+```

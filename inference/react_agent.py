@@ -57,7 +57,7 @@ class MultiTurnReactAgent(FnCallAgent):
         return "<think>" in content and "</think>" in content
     
     def call_server(self, msgs, planning_port, max_tries=10):
-        
+
         openai_api_key = "EMPTY"
         openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
 
@@ -67,29 +67,50 @@ class MultiTurnReactAgent(FnCallAgent):
             timeout=600.0,
         )
 
-        base_sleep_time = 1 
+        base_sleep_time = 1
         for attempt in range(max_tries):
             try:
                 print(f"--- Attempting to call the service, try {attempt + 1}/{max_tries} ---")
-                chat_response = client.chat.completions.create(
+                t_request = time.time()
+                stream = client.chat.completions.create(
                     model=self.model,
                     messages=msgs,
                     stop=["\n<tool_response>", "<tool_response>"],
                     temperature=self.llm_generate_cfg.get('temperature', 0.6),
                     top_p=self.llm_generate_cfg.get('top_p', 0.95),
-                    logprobs=True,
                     max_tokens=10000,
-                    presence_penalty=self.llm_generate_cfg.get('presence_penalty', 1.1)
+                    presence_penalty=self.llm_generate_cfg.get('presence_penalty', 1.1),
+                    stream=True,
+                    stream_options={"include_usage": True},
                 )
-                content = chat_response.choices[0].message.content
 
-                # OpenRouter provides API calling. If you want to use OpenRouter, you need to uncomment line 89 - 90.
-                # reasoning_content = "<think>\n" + chat_response.choices[0].message.reasoning.strip() + "\n</think>"
-                # content = reasoning_content + content                
-                
+                content_parts = []
+                t_first_token = None
+                completion_tokens = 0
+                for chunk in stream:
+                    if chunk.usage:
+                        completion_tokens = chunk.usage.completion_tokens or 0
+                    if chunk.choices:
+                        delta = chunk.choices[0].delta.content
+                        if delta:
+                            if t_first_token is None:
+                                t_first_token = time.time()
+                            content_parts.append(delta)
+                t_end = time.time()
+
+                content = "".join(content_parts)
+
+                # OpenRouter provides API calling. If you want to use OpenRouter, you need to uncomment line below.
+                # reasoning_content = "<think>\n" + ... + "\n</think>"; content = reasoning_content + content
+
+                ttft = (t_first_token - t_request) if t_first_token else 0.0
+                decode_time = (t_end - t_first_token) if t_first_token else 0.0
+                tpot_ms = (decode_time / (completion_tokens - 1) * 1000
+                           if completion_tokens > 1 else 0.0)
+
                 if content and content.strip():
                     print("--- Service call successful, received a valid response ---")
-                    return content.strip()
+                    return content.strip(), ttft, decode_time, completion_tokens, tpot_ms
                 else:
                     print(f"Warning: Attempt {attempt + 1} received an empty response.")
 
@@ -100,14 +121,14 @@ class MultiTurnReactAgent(FnCallAgent):
 
             if attempt < max_tries - 1:
                 sleep_time = base_sleep_time * (2 ** attempt) + random.uniform(0, 1)
-                sleep_time = min(sleep_time, 30) 
-                
+                sleep_time = min(sleep_time, 30)
+
                 print(f"Retrying in {sleep_time:.2f} seconds...")
                 time.sleep(sleep_time)
             else:
                 print("Error: All retry attempts have been exhausted. The call has failed.")
-        
-        return f"vllm server error!!!"
+
+        return "vllm server error!!!", 0.0, 0.0, 0, 0.0
 
     def count_tokens(self, messages):
         tokenizer = AutoTokenizer.from_pretrained(self.llm_local_path) 
@@ -134,7 +155,28 @@ class MultiTurnReactAgent(FnCallAgent):
         system_prompt = system_prompt + str(cur_date)
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
-        round = 0
+        turn = 0
+        latency_rounds = []
+
+        def _build_latency(latency_rounds):
+            total_ttft   = sum(r["llm_ttft_seconds"]   for r in latency_rounds)
+            total_decode = sum(r["llm_decode_seconds"]  for r in latency_rounds)
+            total_tokens = sum(r["completion_tokens"]   for r in latency_rounds)
+            total_tool   = sum(r.get("tool_seconds", 0.0) for r in latency_rounds)
+            n_rounds = len(latency_rounds)
+            global_tpot = (total_decode / (total_tokens - n_rounds) * 1000
+                           if total_tokens > n_rounds else 0.0)
+            return {
+                "e2e_seconds":             round(time.time() - start_time, 3),
+                "total_ttft_seconds":      round(total_ttft, 3),
+                "total_decode_seconds":    round(total_decode, 3),
+                "total_tool_seconds":      round(total_tool, 3),
+                "total_completion_tokens": total_tokens,
+                "mean_tpot_ms":            round(global_tpot, 3),
+                "total_rounds":            n_rounds,
+                "rounds":                  latency_rounds,
+            }
+
         while num_llm_calls_available > 0:
             # Check whether time is reached
             if time.time() - start_time > 150 * 60:  # 150 minutes in seconds
@@ -145,13 +187,21 @@ class MultiTurnReactAgent(FnCallAgent):
                     "answer": answer,
                     "messages": messages,
                     "prediction": prediction,
-                    "termination": termination
+                    "termination": termination,
+                    "latency": _build_latency(latency_rounds),
                 }
                 return result
-            round += 1
+            turn += 1
             num_llm_calls_available -= 1
-            content = self.call_server(messages, planning_port)
-            print(f'Round {round}: {content}')
+
+            round_stats = {"round": turn}
+            content, ttft, decode_time, comp_tokens, tpot_ms = self.call_server(messages, planning_port)
+            round_stats["llm_ttft_seconds"]   = round(ttft, 4)
+            round_stats["llm_decode_seconds"] = round(decode_time, 4)
+            round_stats["completion_tokens"]  = comp_tokens
+            round_stats["tpot_ms"]            = round(tpot_ms, 3)
+
+            print(f'Round {turn}: {content}')
             if '<tool_response>' in content:
                 pos = content.find('<tool_response>')
                 content = content[:pos]
@@ -159,7 +209,9 @@ class MultiTurnReactAgent(FnCallAgent):
             if '<tool_call>' in content and '</tool_call>' in content:
                 tool_call = content.split('<tool_call>')[1].split('</tool_call>')[0]
                 try:
+                    t_tool_start = time.time()
                     if "python" in tool_call.lower():
+                        round_stats["tool_name"] = "PythonInterpreter"
                         try:
                             code_raw=content.split('<tool_call>')[1].split('</tool_call>')[0].split('<code>')[1].split('</code>')[0].strip()
                             result = TOOL_MAP['PythonInterpreter'].call(code_raw)
@@ -170,13 +222,19 @@ class MultiTurnReactAgent(FnCallAgent):
                         tool_call = json5.loads(tool_call)
                         tool_name = tool_call.get('name', '')
                         tool_args = tool_call.get('arguments', {})
+                        round_stats["tool_name"] = tool_name
                         result = self.custom_call_tool(tool_name, tool_args)
 
+                    round_stats["tool_seconds"] = round(time.time() - t_tool_start, 3)
                 except:
+                    round_stats["tool_seconds"] = round(time.time() - t_tool_start, 3)
                     result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
                 result = "<tool_response>\n" + result + "\n</tool_response>"
                 # print(result)
                 messages.append({"role": "user", "content": result})
+
+            latency_rounds.append(round_stats)
+
             if '<answer>' in content and '</answer>' in content:
                 termination = 'answer'
                 break
@@ -185,13 +243,20 @@ class MultiTurnReactAgent(FnCallAgent):
 
             max_tokens = 110 * 1024
             token_count = self.count_tokens(messages)
-            print(f"round: {round}, token count: {token_count}")
+            print(f"round: {turn}, token count: {token_count}")
 
             if token_count > max_tokens:
                 print(f"Token quantity exceeds the limit: {token_count} > {max_tokens}")
-                
+
                 messages[-1]['content'] = "You have now reached the maximum context length you can handle. You should stop making tool calls and, based on all the information above, think again and provide what you consider the most likely answer in the following format:<think>your final thinking</think>\n<answer>your answer</answer>"
-                content = self.call_server(messages, planning_port)
+                forced_stats = {"round": turn + 1, "is_forced_answer": True}
+                content, ttft, decode_time, comp_tokens, tpot_ms = self.call_server(messages, planning_port)
+                forced_stats["llm_ttft_seconds"]   = round(ttft, 4)
+                forced_stats["llm_decode_seconds"]  = round(decode_time, 4)
+                forced_stats["completion_tokens"]   = comp_tokens
+                forced_stats["tpot_ms"]             = round(tpot_ms, 3)
+                latency_rounds.append(forced_stats)
+
                 messages.append({"role": "assistant", "content": content.strip()})
                 if '<answer>' in content and '</answer>' in content:
                     prediction = messages[-1]['content'].split('<answer>')[1].split('</answer>')[0]
@@ -204,7 +269,8 @@ class MultiTurnReactAgent(FnCallAgent):
                     "answer": answer,
                     "messages": messages,
                     "prediction": prediction,
-                    "termination": termination
+                    "termination": termination,
+                    "latency": _build_latency(latency_rounds),
                 }
                 return result
 
@@ -221,7 +287,8 @@ class MultiTurnReactAgent(FnCallAgent):
             "answer": answer,
             "messages": messages,
             "prediction": prediction,
-            "termination": termination
+            "termination": termination,
+            "latency": _build_latency(latency_rounds),
         }
         return result
 
