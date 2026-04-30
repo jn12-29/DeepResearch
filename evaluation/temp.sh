@@ -38,6 +38,20 @@ python evaluation/evaluate_deepsearch_official.py \
     --base_url http://127.0.0.1:8000/v1 \
     --max_workers 32
 
+python evaluation/evaluate_deepsearch_official.py \
+    --input_folder /home/xh/DeepResearch/inference/outputs/Tongyi-DeepResearch-30B-A3B-Int4-W4A16_sglang/test_xbench-2510 \
+    --dataset xbench-deepsearch \
+    --judge_model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+    --base_url http://127.0.0.1:8000/v1 \
+    --max_workers 32
+
+python evaluation/evaluate_deepsearch_official.py \
+    --input_folder /home/xh/DeepResearch/inference/outputs/Tongyi-DeepResearch-30B-A3B-Int4-W4A16_sglang/test_xbench-2510-fp8kv \
+    --dataset xbench-deepsearch \
+    --judge_model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+    --base_url http://127.0.0.1:8000/v1 \
+    --max_workers 32
+
 # HLE 目录（3轮 Pass@k）
 python evaluation/evaluate_hle_official.py \
     --input_folder /home/xh/DeepResearch/inference/outputs/Tongyi-DeepResearch-30B-A3B_sglang/hle_text_200 \

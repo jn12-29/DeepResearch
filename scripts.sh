@@ -63,9 +63,9 @@ pip install -U vllm --pre \
   --extra-index-url https://download.pytorch.org/whl/cu129
 pip install transformers==5.5.0
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 vllm serve /home/xh/DeepResearch/models/Qwen3-30B-A3B-Instruct-2507 \
+CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve /home/xh/DeepResearch/models/Qwen3-30B-A3B-Instruct-2507 \
   --served-model-name Qwen/Qwen3-30B-A3B-Instruct-2507 \
-  --max-model-len 64k \
-  --data-parallel-size 6 \
+  --max-model-len 64K \
+  --data-parallel-size 4 \
   --host 127.0.0.1 \
   --port 8000

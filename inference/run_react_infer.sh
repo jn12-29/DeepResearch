@@ -102,6 +102,7 @@ if [ "$need_start" = "true" ]; then
         --port $VLLM_PORT \
         --data-parallel-size $DP_SIZE \
         --data-parallel-backend mp \
+        --kv-cache-dtype fp8 \
         --disable-log-requests &
 fi
 
